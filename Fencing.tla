@@ -28,7 +28,7 @@ CONSTANTS
     FencerMode,          \* "reliable" | "unreliable" | "none"
     GuardEnabled,        \* FALSE is the broken variant: no generation guard
     ReleaseNeedsFencer,  \* FALSE is the broken variant: reclaim arenas unconfirmed
-    FenceChecksIncarnation  \* TRUE is the PROPOSED FIX (see specs/README.md)
+    FenceChecksIncarnation  \* TRUE is the implemented fix (see specs/README.md)
 
 ASSUME NoNode \notin Nodes
 ASSUME FencerMode \in {"reliable", "unreliable", "none"}
@@ -39,6 +39,16 @@ ASSUME FenceChecksIncarnation \in BOOLEAN
 
 Gens  == 0..MaxGen
 NoGen == MaxGen + 1   \* sentinel: no fence attempt is waiting to bump
+
+(* FenceChecksIncarnation models the check pkg/fencing/controller.go performs
+   before severing, before bumping and before releasing arenas: the fence
+   compares the create-revision of fence_pending:<node> against the one it
+   captured at the start, and abandons the attempt if it has changed or the
+   key is gone.  Membership.grantAndRegister drops that key as the node
+   re-registers, so a node that came back invalidates any fence still in
+   flight for the departure it recovered from.  reRegistered models exactly
+   that: set when the node restarts, cleared when a fence records a new
+   intent for a new departure. *)
 
 (* Nodes are interchangeable: permuting them maps any behaviour to another
    behaviour of the same spec, and none of the invariants name a node.  This

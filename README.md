@@ -26,15 +26,16 @@ counterexample.
 | `FencingNoFencer` | yes | on | none (single-signal) | no counterexample |
 | `FencingUnreliableFencer` | yes | on | unreliable | no counterexample |
 | `FencingGuardIsBackstop` | **no** | on | reliable | no counterexample *(only `StaleWriteRejected` checked)* |
-| `FencingAsImplemented` | **no** | on | reliable | breaks `NoHealthyNodeSevered` |
+| `FencingNoIncarnationCheck` | **no** | on | reliable | breaks `NoHealthyNodeSevered` |
 | `FencingNoGuard` | **no** | **off** | reliable | breaks `StaleWriteRejected` |
 | `FencingArenaBug` | yes | on | none, **but reclaims arenas anyway** | breaks `ReleasedArenaHasNoLiveWriter` |
 
-`FencingAsImplemented` is the protocol as the Go code currently implements it,
-and it is the one that found a real defect — see
+`FencingNoIncarnationCheck` is the protocol as it stood *before* this work: it
+is the configuration that found a real defect, and it is kept so the defect
+stays checked rather than remembered. `FenceChecksIncarnation = TRUE` is what
+`pkg/fencing/controller.go` now does. See
 [docs/verification/tla-plus.md](../docs/verification/tla-plus.md) for the
-trace and the analysis. `FenceChecksIncarnation = TRUE` is the proposed fix,
-not something the code does today.
+traces, the analysis, and why the obvious liveness-based fix was rejected.
 
 ## Why TLA+ actions rather than PlusCal
 
