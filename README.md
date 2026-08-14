@@ -1,8 +1,17 @@
 # TLA+ specifications
 
+Two specifications, one per layer of the exclusion the filesystem rests on.
+
 `Fencing.tla` models the EtcFS fencing protocol — the three layers that keep a
 partitioned node from corrupting the shared device, and the arena ownership
 they hand back and forth.
+
+`CachedLock.tla` models the layer above it: the per-inode lock key, kept rather
+than taken and released per operation, and the three caches that live under it
+— the metadata snapshot, the kernel's data pages, and the writes a node has
+acknowledged and not yet published. What it checks is that every one of those
+caches dies with the key it was made under, and that nothing is ever published
+without it.
 
 Run everything with:
 
@@ -29,6 +38,20 @@ counterexample.
 | `FencingNoIncarnationCheck` | **no** | on | reliable | breaks `NoHealthyNodeSevered` |
 | `FencingNoGuard` | **no** | **off** | reliable | breaks `StaleWriteRejected` |
 | `FencingArenaBug` | yes | on | none, **but reclaims arenas anyway** | breaks `ReleasedArenaHasNoLiveWriter` |
+
+| Configuration | What it takes away | Expected |
+|---|---|---|
+| `CachedLock` | nothing: the protocol as implemented | no counterexample |
+| `CachedLockNoLeaseIdentity` | the cached key is trusted while *any* session is alive | breaks `NoTwoHolders` |
+| `CachedLockNoFlushKeyCheck` | the flush's comparison on this node's own lock key | breaks `NoPublishWithoutLock` |
+| `CachedLockNoRecallFlush` | the flush a recall does before yielding | breaks `NoLostAckedWrite` |
+| `CachedLockNoInvalidate` | the kernel page invalidation before yielding | breaks `NoStalePages` |
+| `CachedLockStaleSnapshot` | dropping the metadata snapshot with the key | breaks `ViewMatchesTruth` |
+| `CachedLockKeepsCacheOnKeyLoss` | dropping the caches when the key is found gone | breaks `NoStalePages` |
+
+`ViewMatchesTruth` is the property every cache here rests on and the one no
+other spec names: what a node believes an inode is equals what etcd records,
+plus whatever that same node has buffered and not yet published.
 
 `FencingNoIncarnationCheck` is the protocol as it stood *before* this work: it
 is the configuration that found a real defect, and it is kept so the defect
@@ -60,5 +83,14 @@ about atomicity.
   generation CAS losing, but two fully interleaved fence sequences for one
   node are not enumerated. A claim that expires under a live fencer is the
   case this would reach; it is the obvious next extension.
+- **Time.** `CachedLock.tla` leaves out the want-key and the minimum hold
+  time, which only ever *delay* a recall: omitting them admits every behaviour
+  they would have allowed and more. It also leaves out the crash case, where
+  unflushed writes are legitimately lost — that is `test/verify`'s extent
+  model, which can see which node died and which writes were fsynced.
+- **Two inodes.** Every action and every invariant in `CachedLock.tla` is about
+  one inode, and nothing relates one to another, so a second would multiply the
+  state space without adding a behaviour. Contention *between* inodes is a
+  scheduling question and belongs to the chaos suite.
 - **The gap between spec and code.** This is a model of the protocol as
   documented, not of `pkg/fencing`. That gap is closed by review.
