@@ -28,7 +28,9 @@ CONSTANTS
     FencerMode,          \* "reliable" | "unreliable" | "none"
     GuardEnabled,        \* FALSE is the broken variant: no generation guard
     ReleaseNeedsFencer,  \* FALSE is the broken variant: reclaim arenas unconfirmed
-    FenceChecksIncarnation  \* TRUE is the implemented fix (see specs/README.md)
+    FenceChecksIncarnation, \* TRUE is the implemented fix (see specs/README.md)
+    HonorDeparture,      \* TRUE: a node that left on purpose is not fenced
+    DepartureIsQuiescent \* FALSE is the broken variant: announce without releasing
 
 ASSUME NoNode \notin Nodes
 ASSUME FencerMode \in {"reliable", "unreliable", "none"}
@@ -36,6 +38,8 @@ ASSUME MaxGen \in Nat
 ASSUME GuardEnabled \in BOOLEAN
 ASSUME ReleaseNeedsFencer \in BOOLEAN
 ASSUME FenceChecksIncarnation \in BOOLEAN
+ASSUME HonorDeparture \in BOOLEAN
+ASSUME DepartureIsQuiescent \in BOOLEAN
 
 Gens  == 0..MaxGen
 NoGen == MaxGen + 1   \* sentinel: no fence attempt is waiting to bump
@@ -69,11 +73,12 @@ VARIABLES
     fenceStep,      \* [Nodes -> {"idle","severed","bumped"}]  where fenceNode has got to
     fenceGen,       \* [Nodes -> Gens \cup {NoGen}]  generation the in-flight fence read
     reRegistered,   \* [Nodes -> BOOLEAN]  has n re-registered since its fence began?
+    departed,       \* [Nodes -> BOOLEAN]  departed:<node>, "I left on purpose"
     fencedCommit    \* TRUE once a node commits metadata after being fenced
 
 vars == << nodeState, lease, startGen, clusterGen, deviceAccess, holds,
            owner, fencePending, fenceDone, fenceStep, fenceGen, reRegistered,
-           reRegistered, fencedCommit >>
+           departed, fencedCommit >>
 
 (***************************************************************************)
 (* `holds' and `owner' are deliberately two variables and not one.  A node  *)
@@ -105,6 +110,7 @@ TypeOK ==
     /\ fenceStep    \in [Nodes -> {"idle", "severed", "bumped"}]
     /\ fenceGen     \in [Nodes -> Gens \cup {NoGen}]
     /\ reRegistered \in [Nodes -> BOOLEAN]
+    /\ departed     \in [Nodes -> BOOLEAN]
     /\ fencedCommit \in BOOLEAN
 
 Init ==
@@ -120,6 +126,7 @@ Init ==
     /\ fenceStep    = [n \in Nodes |-> "idle"]
     /\ fenceGen     = [n \in Nodes |-> NoGen]
     /\ reRegistered = [n \in Nodes |-> FALSE]
+    /\ departed     = [n \in Nodes |-> FALSE]
     /\ fencedCommit = FALSE
 
 (***************************************************************************)
@@ -135,7 +142,7 @@ LeaseExpires(n) ==
     /\ lease' = [lease EXCEPT ![n] = FALSE]
     /\ nodeState' = [nodeState EXCEPT ![n] = "LeaseLost"]
     /\ UNCHANGED << startGen, clusterGen, deviceAccess, holds, owner,
-                    fencePending, fenceDone, fenceStep, fenceGen, reRegistered, fencedCommit >>
+                    fencePending, fenceDone, fenceStep, fenceGen, reRegistered, departed, fencedCommit >>
 
 (* The watchdog notices and the process exits.  The real watchdog fires
    2-3x the lease TTL after the lease dies; TLA+ has no clock, so the delay
@@ -152,7 +159,7 @@ SelfFence(n) ==
     /\ nodeState' = [nodeState EXCEPT ![n] = "SelfFenced"]
     /\ holds' = [holds EXCEPT ![n] = {}]
     /\ UNCHANGED << lease, startGen, clusterGen, deviceAccess, owner,
-                    fencePending, fenceDone, fenceStep, fenceGen, reRegistered, fencedCommit >>
+                    fencePending, fenceDone, fenceStep, fenceGen, reRegistered, departed, fencedCommit >>
 
 (* Power loss or kernel panic: no self-fence, no cleanup, but the process is
    genuinely gone and so are its writes. *)
@@ -162,7 +169,7 @@ NodeCrash(n) ==
     /\ lease' = [lease EXCEPT ![n] = FALSE]
     /\ holds' = [holds EXCEPT ![n] = {}]
     /\ UNCHANGED << startGen, clusterGen, deviceAccess, owner,
-                    fencePending, fenceDone, fenceStep, fenceGen, reRegistered, fencedCommit >>
+                    fencePending, fenceDone, fenceStep, fenceGen, reRegistered, departed, fencedCommit >>
 
 (* A fenced node restarts and adopts whatever generation it now finds: the
    fence is an epoch boundary, not a permanent ban.  It comes back with a
@@ -179,8 +186,52 @@ NodeRestart(n) ==
     \* whatever etcd still says it owns.
     /\ holds' = [holds EXCEPT ![n] = {a \in Arenas : owner[a] = n}]
     /\ reRegistered' = [reRegistered EXCEPT ![n] = TRUE]
+    \* Membership.grantAndRegister drops departed:<node> as it re-registers, so
+    \* a marker describes the departure it was written for and not the node
+    \* for ever.  Without this a node could leave cleanly once and never be
+    \* fenced again, however it died afterwards.
+    /\ departed' = [departed EXCEPT ![n] = FALSE]
     /\ UNCHANGED << clusterGen, owner, fencePending, fenceDone, fenceStep,
                     fenceGen, fencedCommit >>
+
+(* A node leaves on purpose.  This is one etcd transaction -- Put of
+   departed:<n> together with the Delete of membership:<n>, conditioned on the
+   membership key still being there -- so no controller can observe the
+   departure without already being able to see the marker.  That atomicity is
+   what removes any need for a grace window, and with it any clock.
+
+   `lease[n]' as a precondition is the transaction's own comparison: a node
+   whose lease has already timed out is no longer a member and cannot go back
+   and declare its departure intentional.  That is what stops a partitioned
+   node -- the node this entire protocol exists to contain -- from writing
+   itself an exemption.
+
+   DepartureIsQuiescent models the ordering leaveCluster depends on: the node
+   has STOPPED SERVING before it gives anything back, so by the time the marker
+   is published there is no write path left.  Setting it FALSE is the broken
+   variant: the arenas go back and the marker is published by a node that is
+   still running and still believes it owns them.
+
+   Note what that variant is chosen to defeat.  The arena check in FenceStart
+   catches a node that announces a departure while the records still show it as
+   an owner -- so a mutation of that kind proves nothing, because the second
+   line of defence holds.  The case worth checking is the one the arena check
+   CANNOT see: records clean, node still alive.  `holds' and `owner' diverging
+   is exactly how this spec represents a node that cannot be told what the
+   cluster now believes, and it is why quiescence has to come first rather than
+   be inferred from the bookkeeping. *)
+LeaveCleanly(n) ==
+    /\ nodeState[n] = "Healthy"
+    /\ lease[n]
+    /\ lease' = [lease EXCEPT ![n] = FALSE]
+    /\ departed' = [departed EXCEPT ![n] = TRUE]
+    /\ owner' = [a \in Arenas |-> IF owner[a] = n THEN NoNode ELSE owner[a]]
+    /\ IF DepartureIsQuiescent
+         THEN /\ nodeState' = [nodeState EXCEPT ![n] = "Down"]
+              /\ holds' = [holds EXCEPT ![n] = {}]
+         ELSE UNCHANGED << nodeState, holds >>
+    /\ UNCHANGED << startGen, clusterGen, deviceAccess, fencePending,
+                    fenceDone, fenceStep, fenceGen, reRegistered, fencedCommit >>
 
 (***************************************************************************)
 (* The external fencing controller                                          *)
@@ -195,12 +246,19 @@ FenceStart(n) ==
     \* previous attempt's progress.
     /\ fenceStep[n] = "idle"
     /\ ~lease[n]
+    \* Controller.departedCleanly: the marker is honoured only where the
+    \* cluster's own arena records back it up.  A node still recorded as an
+    \* owner has not given up what it says it gave up, so it is fenced exactly
+    \* as it would have been -- which is what makes this a checked claim
+    \* rather than a trusted one.
+    /\ ~(HonorDeparture /\ departed[n] /\ (\A a \in Arenas : owner[a] # n))
     /\ ~fencePending[n]
     /\ ~fenceDone[n]
     /\ fencePending' = [fencePending EXCEPT ![n] = TRUE]
     /\ reRegistered' = [reRegistered EXCEPT ![n] = FALSE]
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, deviceAccess,
-                    holds, owner, fenceDone, fenceStep, fenceGen, fencedCommit >>
+                    holds, owner, fenceDone, fenceStep, fenceGen, departed,
+                    fencedCommit >>
 
 (* Sever the node's access to the device, then queue the generation the bump
    will CAS against.  The ordering is the point: severing is a PRECONDITION
@@ -219,7 +277,7 @@ FenceSever(n) ==
     /\ fenceStep' = [fenceStep EXCEPT ![n] = "severed"]
     /\ fenceGen' = [fenceGen EXCEPT ![n] = clusterGen[n]]
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, holds, owner,
-                    fencePending, fenceDone, reRegistered, fencedCommit >>
+                    fencePending, fenceDone, reRegistered, departed, fencedCommit >>
 
 (* Single-signal mode: no Fencer is configured, so the controller bumps on
    lease expiry alone.  Nothing severs the node from the device -- which is
@@ -231,7 +289,7 @@ FenceSeverSkipped(n) ==
     /\ fenceStep' = [fenceStep EXCEPT ![n] = "severed"]
     /\ fenceGen' = [fenceGen EXCEPT ![n] = clusterGen[n]]
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, deviceAccess,
-                    holds, owner, fencePending, fenceDone, reRegistered, fencedCommit >>
+                    holds, owner, fencePending, fenceDone, reRegistered, departed, fencedCommit >>
 
 (* The CAS bump.  Succeeds only if the generation is still what the fence
    read; a concurrent fence that already bumped it makes this a no-op that
@@ -244,7 +302,7 @@ FenceBump(n) ==
     /\ clusterGen' = [clusterGen EXCEPT ![n] = clusterGen[n] + 1]
     /\ fenceStep' = [fenceStep EXCEPT ![n] = "bumped"]
     /\ UNCHANGED << nodeState, lease, startGen, deviceAccess, holds, owner,
-                    fencePending, fenceDone, fenceGen, reRegistered, fencedCommit >>
+                    fencePending, fenceDone, fenceGen, reRegistered, departed, fencedCommit >>
 
 (* The CAS lost: another fence bumped this node's generation in between.
    The controller re-reads, logs, and does not retry. *)
@@ -254,7 +312,7 @@ FenceBumpLostCAS(n) ==
     /\ fenceStep' = [fenceStep EXCEPT ![n] = "idle"]
     /\ fenceGen' = [fenceGen EXCEPT ![n] = NoGen]
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, deviceAccess,
-                    holds, owner, fencePending, fenceDone, reRegistered, fencedCommit >>
+                    holds, owner, fencePending, fenceDone, reRegistered, departed, fencedCommit >>
 
 (* Reclaim the fenced node's arena.  This runs INSIDE fenceNode, immediately
    after the bump and before the completion mark -- it is a separate etcd
@@ -274,7 +332,7 @@ FenceReleaseArena(n, a) ==
     /\ owner' = [owner EXCEPT ![a] = NoNode]
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, deviceAccess,
                     holds, fencePending, fenceDone, fenceStep, fenceGen,
-                    reRegistered, fencedCommit >>
+                    reRegistered, departed, fencedCommit >>
 
 (* MarkFenceComplete then ClearFenceIntent: only now is nothing owed. *)
 FenceComplete(n) ==
@@ -284,7 +342,7 @@ FenceComplete(n) ==
     /\ fenceStep' = [fenceStep EXCEPT ![n] = "idle"]
     /\ fenceGen' = [fenceGen EXCEPT ![n] = NoGen]
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, deviceAccess,
-                    holds, owner, reRegistered, fencedCommit >>
+                    holds, owner, reRegistered, departed, fencedCommit >>
 
 (* The controller dies part-way through.  Its claim lease expires; the intent
    survives, so the sweep retries the whole fence.  Device access stays
@@ -294,7 +352,7 @@ FenceAbort(n) ==
     /\ fenceStep' = [fenceStep EXCEPT ![n] = "idle"]
     /\ fenceGen' = [fenceGen EXCEPT ![n] = NoGen]
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, deviceAccess,
-                    holds, owner, fencePending, fenceDone, reRegistered, fencedCommit >>
+                    holds, owner, fencePending, fenceDone, reRegistered, departed, fencedCommit >>
 
 (* The sweep finds a live membership key for a node it was about to fence:
    the node has recovered from the expiry that triggered the fence, so the
@@ -306,7 +364,7 @@ DropIntentOnReRegister(n) ==
     /\ fencePending' = [fencePending EXCEPT ![n] = FALSE]
     /\ fenceDone' = [fenceDone EXCEPT ![n] = FALSE]
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, deviceAccess,
-                    holds, owner, fenceStep, fenceGen, reRegistered, fencedCommit >>
+                    holds, owner, fenceStep, fenceGen, reRegistered, departed, fencedCommit >>
 
 (***************************************************************************)
 (* Arenas                                                                   *)
@@ -318,7 +376,7 @@ ClaimArena(n, a) ==
     /\ owner' = [owner EXCEPT ![a] = n]
     /\ holds' = [holds EXCEPT ![n] = holds[n] \cup {a}]
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, deviceAccess,
-                    fencePending, fenceDone, fenceStep, fenceGen, reRegistered, fencedCommit >>
+                    fencePending, fenceDone, fenceStep, fenceGen, reRegistered, departed, fencedCommit >>
 
 (***************************************************************************)
 (* The write path                                                           *)
@@ -340,7 +398,7 @@ Write(n, a) ==
     /\ fencedCommit' = (fencedCommit \/ startGen[n] # clusterGen[n])
     /\ UNCHANGED << nodeState, lease, startGen, clusterGen, deviceAccess,
                     holds, owner, fencePending, fenceDone, fenceStep, fenceGen,
-                    reRegistered >>
+                    reRegistered, departed >>
 
 (***************************************************************************)
 
@@ -350,6 +408,7 @@ Next ==
         \/ SelfFence(n)
         \/ NodeCrash(n)
         \/ NodeRestart(n)
+        \/ LeaveCleanly(n)
         \/ FenceStart(n)
         \/ FenceSever(n)
         \/ FenceSeverSkipped(n)

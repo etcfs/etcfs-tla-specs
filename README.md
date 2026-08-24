@@ -38,6 +38,7 @@ counterexample.
 | `FencingNoIncarnationCheck` | **no** | on | reliable | breaks `NoHealthyNodeSevered` |
 | `FencingNoGuard` | **no** | **off** | reliable | breaks `StaleWriteRejected` |
 | `FencingArenaBug` | yes | on | none, **but reclaims arenas anyway** | breaks `ReleasedArenaHasNoLiveWriter` |
+| `FencingDepartureNotQuiescent` | yes | on | reliable, **departure announced without stopping** | breaks `ReleasedArenaHasNoLiveWriter` |
 
 | Configuration | What it takes away | Expected |
 |---|---|---|
