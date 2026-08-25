@@ -122,6 +122,11 @@ Init ==
    uses it.  That is why the *drop* is the load-bearing half, and why
    DropSnapshotOnYield FALSE -- a snapshot that outlives the key it was read
    under -- is the mistake the holder token exists to prevent. *)
+(* A lock a node takes in the transaction that *creates* the inode is this
+   action too, not a weaker one: the create asserts the same empty blocking
+   range an ordinary acquisition asserts, and the snapshot it seeds is the
+   record that transaction just wrote -- which is `published', exactly what
+   this action already gives a node with no view of its own. *)
 Acquire(n) ==
     /\ keyOwner = NoNode
     /\ ~cached[n]
@@ -156,7 +161,17 @@ Read(n) ==
    A rejected flush discards the buffer -- nothing in etcd ever referenced
    those blocks -- and that discard is not a lost acknowledged write in the
    sense NoLostAckedWrite means: the session was gone, which is the one case
-   POSIX allows an unsynced write to vanish in. *)
+   POSIX allows an unsynced write to vanish in.
+
+   Nothing here says *when* a flush runs, and that is deliberate: it is enabled
+   from the moment there is a buffer until something takes the buffer away, so
+   every schedule the implementation could pick is already a behaviour of this
+   spec.  Publishing on close(), publishing on a timer, and publishing several
+   inodes in one transaction are the same action here -- the last of those
+   because this is a one-inode model and a shared transaction adds atomicity
+   *between* inodes, which no invariant below constrains.  What is not free to
+   move is the comparison, which is per inode and stays per inode however many
+   inodes ride one commit. *)
 Flush(n) ==
     /\ cached[n]
     /\ buf[n] # NoVal
@@ -178,7 +193,13 @@ Flush(n) ==
    every behaviour they would have allowed and more.  What is not left out is
    the order the release runs in, which is where the obligations are:
    publish, then invalidate the kernel's pages, then delete the key.
-   Everything cached under that key goes with it. *)
+   Everything cached under that key goes with it.
+
+   Yielding several keys in one etcd transaction -- which is how the cache
+   evicts -- is this action once per inode.  The order above is what has to hold
+   per inode, and a shared delete only makes the last step of each atomic with
+   the others, which is strictly stronger than the separate deletes modelled
+   here. *)
 Recall(n) ==
     /\ cached[n]
     /\ LET owns    == keyOwner = n

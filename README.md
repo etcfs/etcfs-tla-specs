@@ -61,6 +61,26 @@ stays checked rather than remembered. `FenceChecksIncarnation = TRUE` is what
 [docs/verification/tla-plus.md](../docs/verification/tla-plus.md) for the
 traces, the analysis, and why the obvious liveness-based fix was rejected.
 
+## What the commit-reduction work did not change
+
+Three of the Raft commits a file creation used to cost were removed on
+2026-08-25: the lock key now rides the create transaction, evicted keys are
+deleted a batch at a time, and deferred extents are published for many inodes at
+once. None of the three needed a model change, and the reason is recorded in the
+spec rather than left to memory:
+
+- Taking the lock inside the create is `Acquire`, asserting the same empty
+  blocking range and seeding the same snapshot the action already gives.
+- Deleting a batch of keys is `Recall` once per inode, with the last step of
+  each made atomic with the others — stronger than what is modelled.
+- Publishing many inodes in one transaction is `Flush` once per inode. The
+  action is enabled from the moment a buffer exists, so *when* a node flushes —
+  on close, on a timer, or in a batch — is already unconstrained here; the
+  comparison that makes a flush safe is per inode and stays per inode.
+
+All fifteen configurations were re-checked after the change and behaved exactly
+as the tables above say.
+
 ## Why TLA+ actions rather than PlusCal
 
 The plan called for PlusCal. Every question this spec exists to answer is a
