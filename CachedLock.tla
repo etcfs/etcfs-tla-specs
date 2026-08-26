@@ -36,7 +36,8 @@ CONSTANTS
     RecallFlushes,        \* FALSE is the broken variant: yield with writes buffered
     InvalidateOnYield,    \* FALSE is the broken variant: keep the kernel's pages
     DropSnapshotOnYield,  \* FALSE is the broken variant: keep a snapshot past the key
-    DropCacheOnKeyLoss    \* FALSE is the broken variant: keep caches past the key
+    DropCacheOnKeyLoss,   \* FALSE is the broken variant: keep caches past the key
+    DiscardOrphanedKey    \* FALSE is the broken variant: leave a create's key standing
 
 ASSUME NoNode \notin Nodes
 ASSUME MaxVal \in Nat /\ MaxLease \in Nat
@@ -46,6 +47,7 @@ ASSUME RecallFlushes \in BOOLEAN
 ASSUME InvalidateOnYield \in BOOLEAN
 ASSUME DropSnapshotOnYield \in BOOLEAN
 ASSUME DropCacheOnKeyLoss \in BOOLEAN
+ASSUME DiscardOrphanedKey \in BOOLEAN
 
 Vals  == 1..MaxVal
 NoVal == 0          \* sentinel: nothing written yet, or nothing buffered
@@ -67,10 +69,11 @@ VARIABLES
     pages,          \* [Nodes -> BOOLEAN]  the kernel holds data pages for the inode
     published,      \* Vals \cup {NoVal}: what etcd records, i.e. what a peer would read
     publishedUnowned, \* TRUE once a flush has committed without the key
-    lostAckedWrite    \* TRUE once a recall has dropped acknowledged writes
+    lostAckedWrite,   \* TRUE once a recall has dropped acknowledged writes
+    orphan            \* TRUE while a key stands that no node's cache names
 
 vars == << keyOwner, cached, keyLease, session, view, buf, pages, published,
-           publishedUnowned, lostAckedWrite >>
+           publishedUnowned, lostAckedWrite, orphan >>
 
 (***************************************************************************)
 (* `cached' and `keyOwner' are two variables for the same reason `holds'    *)
@@ -99,6 +102,7 @@ TypeOK ==
     /\ published \in Vals \cup {NoVal}
     /\ publishedUnowned \in BOOLEAN
     /\ lostAckedWrite   \in BOOLEAN
+    /\ orphan          \in BOOLEAN
 
 Init ==
     /\ keyOwner  = NoNode
@@ -111,6 +115,7 @@ Init ==
     /\ published = NoVal
     /\ publishedUnowned = FALSE
     /\ lostAckedWrite   = FALSE
+    /\ orphan          = FALSE
 
 (***************************************************************************)
 (* Taking and keeping the key                                               *)
@@ -134,7 +139,7 @@ Acquire(n) ==
     /\ cached'   = [cached   EXCEPT ![n] = TRUE]
     /\ keyLease' = [keyLease EXCEPT ![n] = session[n]]
     /\ view'     = [view EXCEPT ![n] = IF view[n] = NoVal THEN published ELSE view[n]]
-    /\ UNCHANGED << session, buf, pages, published, publishedUnowned, lostAckedWrite >>
+    /\ UNCHANGED << session, buf, pages, published, publishedUnowned, lostAckedWrite, orphan >>
 
 (* A write is acknowledged out of RAM: its bytes are on no device and in no
    etcd record until a flush publishes them.  The node's own view moves with
@@ -144,7 +149,7 @@ Write(n, v) ==
     /\ buf'  = [buf  EXCEPT ![n] = v]
     /\ view' = [view EXCEPT ![n] = v]
     /\ UNCHANGED << keyOwner, cached, keyLease, session, pages, published,
-                    publishedUnowned, lostAckedWrite >>
+                    publishedUnowned, lostAckedWrite, orphan >>
 
 (* A read the kernel is allowed to cache, because this node holds the lock.
    From here the pages answer later reads without the daemon seeing them at
@@ -153,7 +158,7 @@ Read(n) ==
     /\ Holds(n)
     /\ pages' = [pages EXCEPT ![n] = TRUE]
     /\ UNCHANGED << keyOwner, cached, keyLease, session, view, buf, published,
-                    publishedUnowned, lostAckedWrite >>
+                    publishedUnowned, lostAckedWrite, orphan >>
 
 (* The flush: one transaction, with a comparison on this node's own lock key.
    That comparison is the only thing standing between a node that lost the
@@ -181,7 +186,7 @@ Flush(n) ==
                   /\ publishedUnowned' = (publishedUnowned \/ ~owns)
              ELSE UNCHANGED << published, publishedUnowned >>
     /\ buf' = [buf EXCEPT ![n] = NoVal]
-    /\ UNCHANGED << keyOwner, cached, keyLease, session, view, pages, lostAckedWrite >>
+    /\ UNCHANGED << keyOwner, cached, keyLease, session, view, pages, lostAckedWrite, orphan >>
 
 (***************************************************************************)
 (* Giving the key up                                                        *)
@@ -214,7 +219,7 @@ Recall(n) ==
     /\ view'     = [view     EXCEPT ![n] = IF DropSnapshotOnYield THEN NoVal ELSE view[n]]
     /\ buf'      = [buf      EXCEPT ![n] = NoVal]
     /\ keyOwner' = IF keyOwner = n THEN NoNode ELSE keyOwner
-    /\ UNCHANGED << keyLease, session, publishedUnowned >>
+    /\ UNCHANGED << keyLease, session, publishedUnowned, orphan >>
 
 (* The lock session expires.  etcd deletes the key with it and a peer may
    take the inode immediately; the node itself is still running and still
@@ -224,6 +229,10 @@ SessionLost(n) ==
     /\ session[n] < MaxLease
     /\ session'  = [session EXCEPT ![n] = session[n] + 1]
     /\ keyOwner' = IF keyOwner = n THEN NoNode ELSE keyOwner
+    \* etcd deletes the key with the lease, orphaned or not: this is the bound
+    \* on how long an undiscarded one can block the inode, and the only thing
+    \* that ends it without the node's help.
+    /\ orphan'   = IF keyOwner = n THEN FALSE ELSE orphan
     /\ UNCHANGED << cached, keyLease, view, buf, pages, published,
                     publishedUnowned, lostAckedWrite >>
 
@@ -243,7 +252,42 @@ NoticeKeyLost(n) ==
               /\ pages' = [pages EXCEPT ![n] = FALSE]
          ELSE UNCHANGED << view, buf, pages >>
     /\ UNCHANGED << keyOwner, keyLease, session, published, publishedUnowned,
-                    lostAckedWrite >>
+                    lostAckedWrite, orphan >>
+
+(***************************************************************************)
+(* A lock key taken by the transaction that creates the inode                *)
+(***************************************************************************)
+
+(* The create commits and the node does not learn that it did.
+   Every other way that transaction can end is already an action here: it
+   commits and the node knows, which is Acquire, or it does not commit, which
+   leaves nothing behind.  This is the third, and it is the one the create-time
+   lock adds -- a key standing in etcd under a holder token no cache entry
+   names.  Nothing can release it: every path that gives a key up starts from a
+   node believing it holds one, and no node does.
+   The write path is untouched by it, since a node that does not believe it
+   holds the inode does not act on it -- what is lost is the inode itself, to
+   every node, until the key goes. *)
+CreateLockOrphaned(n) ==
+    /\ keyOwner = NoNode
+    /\ ~cached[n]
+    /\ ~orphan
+    /\ keyOwner' = n
+    /\ orphan'   = TRUE
+    /\ UNCHANGED << cached, keyLease, session, view, buf, pages, published,
+                    publishedUnowned, lostAckedWrite >>
+
+(* The node deletes the key it minted, by the token only it ever had.  This is
+   what handleCreate does on every path that does not seed the cache with it,
+   and DiscardOrphanedKey FALSE is the variant that skips it. *)
+DiscardOrphan(n) ==
+    /\ DiscardOrphanedKey
+    /\ orphan
+    /\ keyOwner = n
+    /\ keyOwner' = NoNode
+    /\ orphan'   = FALSE
+    /\ UNCHANGED << cached, keyLease, session, view, buf, pages, published,
+                    publishedUnowned, lostAckedWrite >>
 
 (***************************************************************************)
 
@@ -255,9 +299,17 @@ Next ==
         \/ Recall(n)
         \/ SessionLost(n)
         \/ NoticeKeyLost(n)
+        \/ CreateLockOrphaned(n)
+        \/ DiscardOrphan(n)
     \/ \E n \in Nodes, v \in Vals : Write(n, v)
 
 Spec == Init /\ [][Next]_vars
+
+(* The orphan configurations check a liveness property, so the discard has to
+   be required to happen rather than merely allowed.  Weak fairness is the
+   right strength: the discard is a retried delete on a path that has nothing
+   else to do, not something that has to be attempted at exactly one instant. *)
+OrphanSpec == Spec /\ WF_vars(\E n \in Nodes : DiscardOrphan(n))
 
 (***************************************************************************)
 (* Safety                                                                   *)
@@ -294,6 +346,15 @@ NoStalePages == \A n \in Nodes : pages[n] => cached[n]
 ViewMatchesTruth ==
     \A n \in Nodes :
         Holds(n) => view[n] = IF buf[n] # NoVal THEN buf[n] ELSE published
+
+(* An inode whose key nobody holds and nobody can release is lost to the whole
+   cluster: Acquire needs the key free, and every release starts from a node
+   that believes it holds it.  So the obligation the create-time lock takes on
+   is that a key it minted and did not cache is deleted -- not that the window
+   never happens, which no protocol over a lossy reply can promise, but that it
+   ends.  Checked as liveness because that is what it is; the state itself
+   breaks no safety invariant, which is exactly why it needs saying. *)
+OrphanFreed == orphan ~> ~orphan
 
 (* Nodes are interchangeable and no invariant names one, so TLC may collapse
    states that differ only by a permutation of them. *)
