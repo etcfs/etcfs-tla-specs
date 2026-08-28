@@ -16,11 +16,11 @@ without it.
 Run everything with:
 
 ```sh
-scripts/test/tla-check.sh          # 2-node models, ~30s
-DEEP=1 scripts/test/tla-check.sh   # adds the 3-node model, several minutes
+./check.sh          # 2-node models, ~30s
+DEEP=1 ./check.sh   # adds the 3-node model, several minutes
 ```
 
-The script downloads `tla2tools.jar` into `specs/.tools/` on first use (it is
+The script downloads `tla2tools.jar` into `.tools/` on first use (it is
 gitignored) and asserts the outcome each configuration is *supposed* to have.
 Three of them are supposed to fail: a spec that proves everything proves
 nothing, so the deliberately broken variants are checked to still produce a
