@@ -22,7 +22,7 @@ DEEP=1 ./check.sh   # adds the 3-node model, several minutes
 
 The script downloads `tla2tools.jar` into `.tools/` on first use (it is
 gitignored) and asserts the outcome each configuration is *supposed* to have.
-Three of them are supposed to fail: a spec that proves everything proves
+Eleven of the seventeen run by default are supposed to fail: a spec that proves everything proves
 nothing, so the deliberately broken variants are checked to still produce a
 counterexample.
 
@@ -49,6 +49,8 @@ counterexample.
 | `CachedLockNoInvalidate` | the kernel page invalidation before yielding | breaks `NoStalePages` |
 | `CachedLockStaleSnapshot` | dropping the metadata snapshot with the key | breaks `ViewMatchesTruth` |
 | `CachedLockKeepsCacheOnKeyLoss` | dropping the caches when the key is found gone | breaks `NoStalePages` |
+| `CachedLockOrphanedKey` | nothing: a create's key left standing is deleted by its token | no counterexample |
+| `CachedLockNoOrphanDiscard` | deleting a create's orphaned lock key | breaks `OrphanFreed` |
 
 `ViewMatchesTruth` is the property every cache here rests on and the one no
 other spec names: what a node believes an inode is equals what etcd records,
@@ -58,7 +60,7 @@ plus whatever that same node has buffered and not yet published.
 is the configuration that found a real defect, and it is kept so the defect
 stays checked rather than remembered. `FenceChecksIncarnation = TRUE` is what
 `pkg/fencing/controller.go` now does. See
-[docs/verification/tla-plus.md](../docs/verification/tla-plus.md) for the
+`docs/verification/tla-plus.md` in the etcfs-docs repository for the
 traces, the analysis, and why the obvious liveness-based fix was rejected.
 
 ## What the commit-reduction work did not change

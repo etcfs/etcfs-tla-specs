@@ -2,10 +2,10 @@
 # Runs TLC over every model configuration in specs/ and asserts the outcome
 # each one is supposed to have.
 #
-# Half the configurations are supposed to FAIL. A spec that proves everything
-# proves nothing, so the deliberately broken variants are checked to still
+# Eleven of the seventeen configurations run by default are supposed to
+# FAIL. A spec that proves everything proves nothing, so the deliberately broken variants are checked to still
 # produce a counterexample — the same reasoning as the negative controls in
-# test/verify (see docs/verification/porcupine.md).
+# the etcfs repository's test/verify (see etcfs-docs verification/porcupine.md).
 #
 # Usage:
 #   ./check.sh            # the 2-node models, ~10s total

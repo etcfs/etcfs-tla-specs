@@ -28,7 +28,7 @@ CONSTANTS
     FencerMode,          \* "reliable" | "unreliable" | "none"
     GuardEnabled,        \* FALSE is the broken variant: no generation guard
     ReleaseNeedsFencer,  \* FALSE is the broken variant: reclaim arenas unconfirmed
-    FenceChecksIncarnation, \* TRUE is the implemented fix (see specs/README.md)
+    FenceChecksIncarnation, \* TRUE is the implemented fix (see README.md)
     HonorDeparture,      \* TRUE: a node that left on purpose is not fenced
     DepartureIsQuiescent \* FALSE is the broken variant: announce without releasing
 
