@@ -3,9 +3,9 @@
 # each one is supposed to have.
 #
 # Eleven of the seventeen configurations run by default are supposed to
-# FAIL. A spec that proves everything proves nothing, so the deliberately broken variants are checked to still
-# produce a counterexample — the same reasoning as the negative controls in
-# the etcfs repository's test/verify (see etcfs-docs verification/porcupine.md).
+# FAIL. A spec that proves everything proves nothing, so the deliberately
+# broken variants are checked to still produce a counterexample, as the
+# negative controls in the etcfs repository's test/verify are.
 #
 # Usage:
 #   ./check.sh            # the 2-node models, ~10s total
